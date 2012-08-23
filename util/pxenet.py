@@ -13,7 +13,8 @@ we need to do it ourselves through sysfs.
 
 import os
 import re
-import netcf
+
+from netcf import NetCF
 
 def find_interface(mac):
     """

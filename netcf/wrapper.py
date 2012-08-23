@@ -46,18 +46,18 @@ class NetCFError(Exception):
         self.message = message
         self.details = details
 
-def check_result(ncf, res):
+def check_result(ncf):
     """
-    Raises an exception if passed unsuccessfull netcf result.
+    Raises an exception if previous ncf command failed.
 
-    :param res: is the result to examine.
-                None or numbers below zero are treated as failures.
+    :param ncf: the netcf context to examine.
     """
 
-    if res is None or res < 0:
-        errmsgp = c_char_p()
-        detailsp = c_char_p()
-        code = ncf_error(ncf, pointer(errmsgp), pointer(detailsp))
+    errmsgp = c_char_p()
+    detailsp = c_char_p()
+    code = ncf_error(ncf, pointer(errmsgp), pointer(detailsp))
+
+    if NetCFError.NOERROR != code:
         raise NetCFError(code, errmsgp.value, detailsp.value)
 
 class Interface(object):
@@ -71,33 +71,36 @@ class Interface(object):
     INACTIVE = 1
     ACTIVE = 2
 
-    def __init__(self, parent, iface):
+    def __init__(self, parent, name):
         """
         Constructs network interface proxy.
 
-        You don't need to instantiate this class directly. You probably
-        want to ask NetCF to give it to you using e.g. ``nc['eth0']``.
-
-        :param parent: points to netcf instance required for error handling.
-        :param iface: C pointer to netcf_if structure.
+        :param parent: pointer to parent NetCF context.
+        :param name: name of the interface.
         """
 
-        # Make extra sure, since otherwise it's a sure segfault.
-        assert isinstance(iface, POINTER(netcf_if_t))
-
         self.parent = parent
-        self.iface = iface
+
+        self.iface = ncf_lookup_by_name(self.parent.ncf, name)
+        if self.iface is None:
+            check_result(self.parent.ncf)
+            raise KeyError('interface %s not found' % name)
+
         track_for_finalization(self, self.iface, ncf_if_free)
 
     @property
     def name(self):
         """Returns name of the interface."""
-        return ncf_if_name(self.iface)
+        name = ncf_if_name(self.iface)
+        check_result(self.parent.ncf)
+        return cast(name, c_char_p).value
 
     @property
     def mac(self):
         """Returns mac address of the interface."""
-        return ncf_if_mac_string(self.iface)
+        mac = ncf_if_mac_string(self.iface)
+        check_result(self.parent.ncf)
+        return cast(mac, c_char_p).value
 
     @property
     def xml_desc(self):
@@ -109,6 +112,9 @@ class Interface(object):
         """
 
         desc = ncf_if_xml_desc(self.iface)
+        check_result(self.parent.ncf)
+        if desc is None:
+            return None
         strval = cast(desc, c_char_p).value
         free(desc)
         return strval
@@ -117,6 +123,9 @@ class Interface(object):
     def xml_state(self):
         """Returns XML with current state of the interface."""
         state = ncf_if_xml_state(self.iface)
+        check_result(self.parent.ncf)
+        if state is None:
+            return None
         strval = cast(state, c_char_p).value
         free(state)
         return strval
@@ -130,17 +139,25 @@ class Interface(object):
         or `Interface.DOWN`.
         """
 
-        status = c_uint()
-        check_result(self.parent.ncf, ncf_if_status(self.iface, pointer(status)))
+        status = c_uint(0)
+        ncf_if_status(self.iface, pointer(status))
+        check_result(self.parent.ncf)
         return int(status.value)
 
     def up(self):
         """Brings the interface up."""
-        check_result(self.parent.ncf, ncf_if_up(self.iface))
+        ncf_if_up(self.iface)
+        check_result(self.parent.ncf)
 
     def down(self):
         """Tears the interface down."""
-        check_result(self.parent.ncf, ncf_if_down(self.iface))
+        ncf_if_down(self.iface)
+        check_result(self.parent.ncf)
+
+    def undefine(self):
+        """Undefines this interface."""
+        ncf_if_undefine(self.iface)
+        check_result(self.parent.ncf)
 
     def __repr__(self):
         return '<Interface "%s">' % self.name
@@ -157,8 +174,10 @@ class NetCF(object):
         :param root: path to system to operate on.
         """
 
-        self.ncf = POINTER(netcf_t)()
-        check_result(self.ncf, ncf_init(self.ncf, root))
+        self.ncf = c_void_p()
+        if 0 != ncf_init(self.ncf, root):
+            raise RuntimeError('failed to initialize netcf context')
+        check_result(self.ncf)
         track_for_finalization(self, self.ncf, ncf_close)
 
     def define(self, xml):
@@ -170,14 +189,15 @@ class NetCF(object):
         """
 
         iface = ncf_define(self.ncf, xml)
-        check_result(self.ncf, iface)
-        return Interface(self, iface)
+        check_result(self.ncf)
 
     def __len__(self):
         """
         Returns number of all known interfaces.
         """
-        return ncf_num_of_interfaces(self.ncf, Interface.ACTIVE | Interface.INACTIVE)
+        num = ncf_num_of_interfaces(self.ncf, Interface.ACTIVE | Interface.INACTIVE)
+        check_result(self.ncf)
+        return num
 
     def __getitem__(self, name):
         """
@@ -185,9 +205,7 @@ class NetCF(object):
 
         :param name: name of the interface.
         """
-        if name not in self:
-            raise KeyError
-        return Interface(self, ncf_lookup_by_name(self.ncf, name))
+        return Interface(self, name)
 
     def __iter__(self):
         """
@@ -196,6 +214,7 @@ class NetCF(object):
         count = len(self)
         names = (c_char_p * count)()
         count = ncf_list_interfaces(self.ncf, count, names, Interface.ACTIVE | Interface.INACTIVE)
+        check_result(self.ncf)
         return iter([names[i] for i in xrange(count)])
 
     def lookup_by_mac(self, macaddr):
@@ -205,18 +224,10 @@ class NetCF(object):
         :param macaddr: the mac address to look for.
         """
         count = len(self)
-        ifaces = (POINTER(netcf_if_t) * count)()
-        count = ncf_lookup_by_mac_string(self.ncf, macaddr, count, cast(pointer(ifaces), POINTER(POINTER(netcf_if_t))))
+        ifaces = (c_void_p * count)()
+        count = ncf_lookup_by_mac_string(self.ncf, macaddr, count, cast(pointer(ifaces), POINTER(c_void_p)))
+        check_result(self.ncf)
         return iter([Interface(self, ifaces[x]) for x in xrange(count)])
-
-    def __delitem__(self, name):
-        """
-        Undefines specified interface.
-
-        :param name: name of the interface.
-        """
-        iface = self[name]
-        check_result(self.ncf, ncf_if_undefine(iface.iface))
 
     def __enter__(self):
         """
@@ -229,7 +240,8 @@ class NetCF(object):
 
         The `__exit__()` then takes care of the commit or revert.
         """
-        check_result(self.ncf, ncf_change_begin(self.ncf, 0))
+        ncf_change_begin(self.ncf, 0)
+        check_result(self.ncf)
 
     def __exit__(self, exc_type, value, traceback):
         """
@@ -240,9 +252,10 @@ class NetCF(object):
         """
 
         if exc_type is None:
-            check_result(self.ncf, ncf_change_commit(self.ncf, 0))
+            ncf_change_commit(self.ncf, 0)
         else:
-            check_result(self.ncf, ncf_change_rollback(self.ncf, 0))
+            ncf_change_rollback(self.ncf, 0)
+        check_result(self.ncf)
 
 
 # vim:set sw=4 ts=4 et:
